@@ -32,6 +32,19 @@ Jev answers **three questions in one ~70-500ms call** per market:
 
 All three are batched into a single request to `api.typesafe.ai/v1/systemone`.
 
+## Risk controls
+
+The paper executor enforces hard risk rules so the bot never loses more than intended:
+
+| Rule | Enforced in |
+|------|-------------|
+| **Max $5 per trade** | `execute_trade()` caps any entry at $5 (see `MAX_BET`) |
+| **Never negative balance** | Trading blocked when balance ≤ $0 |
+| **No auto cash-out** | Bot never withdraws mid-run |
+| **+75% PnL → hard stop** | At +75% PnL the bot locks itself (`bot_locked`), persists the lock to `paper_state.json`, and refuses all further trades until manually restarted (`STOP_THRESHOLD`) |
+
+Trade freely below the +75% stop; the only hard halt is the +75% ceiling (manual restart required to resume).
+
 ## Setup
 
 ```bash
