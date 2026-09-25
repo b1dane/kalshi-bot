@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+<meta name="theme-color" content="#0a0e1a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Kalshi BTC Bot</title>
+<link rel="manifest" href="/static/manifest.webmanifest">
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/static/icon.svg">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="app">
+    <div class="top-bar">
+      <span class="top-title">Kalshi BTC Bot</span>
+      <span class="top-status" id="topStatus">connecting...</span>
+    </div>
+
+    <div class="screen-container" id="screenContainer">
+      <!-- ── DASHBOARD ────────────────────────────────────────── -->
+      <div class="screen" id="screen-dashboard">
+        <div class="card stats-grid">
+          <div class="stat">
+            <span class="stat-label">Balance</span>
+            <span class="stat-value" id="dashBalance">$---</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">P&amp;L</span>
+            <span class="stat-value" id="dashPnl">$---</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Win Rate</span>
+            <span class="stat-value" id="dashWinRate">--%</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Trades</span>
+            <span class="stat-value" id="dashTrades">0</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Open</span>
+            <span class="stat-value" id="dashOpen">0</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">W / L</span>
+            <span class="stat-value" id="dashWinLoss">0 / 0</span>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">Balance History</div>
+          <div class="sparkline-wrap">
+            <canvas id="sparkline" width="440" height="100"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── LIVE FEED ─────────────────────────────────────────── -->
+      <div class="screen" id="screen-feed">
+        <div class="list" id="feedList">
+          <div class="list-empty">Waiting for data…</div>
+        </div>
+      </div>
+
+      <!-- ── TRADES ────────────────────────────────────────────── -->
+      <div class="screen" id="screen-trades">
+        <div class="list" id="tradesList">
+          <div class="list-empty">No trades yet.</div>
+        </div>
+      </div>
+
+      <!-- ── SETTINGS ──────────────────────────────────────────── -->
+      <div class="screen" id="screen-settings">
+        <div class="card">
+          <div class="card-title">Settings</div>
+          <div class="setting-row">
+            <span class="setting-label">Mode</span>
+            <label class="toggle">
+              <input type="checkbox" id="modeToggle">
+              <span class="toggle-slider"></span>
+              <span class="toggle-text" id="modeText">Paper</span>
+            </label>
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">Position Size</span>
+            <input type="number" class="setting-input" id="positionSize" min="1" max="100" value="1">
+          </div>
+          <div class="setting-row">
+            <span class="setting-label">Conviction Floor</span>
+            <div class="conviction-picker" id="convictionPicker">
+              <button class="conv-btn" data-v="0">0</button>
+              <button class="conv-btn" data-v="1">1</button>
+              <button class="conv-btn" data-v="2">2</button>
+              <button class="conv-btn" data-v="3">3</button>
+            </div>
+          </div>
+          <button class="btn-primary" id="saveSettings">Save Settings</button>
+          <div class="save-msg" id="saveMsg"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Bottom Nav ─────────────────────────────────────────── -->
+    <nav class="bottom-nav" id="bottomNav">
+      <button class="nav-btn active" data-screen="dashboard">
+        <svg viewBox="0 0 24 24" width="24" height="24"><rect x="4" y="4" width="16" height="16" rx="2" fill="currentColor"/><path d="M6 18 L18 6" stroke="currentColor" stroke-width="2"/></svg>
+        <span>Dashboard</span>
+      </button>
+      <button class="nav-btn" data-screen="feed">
+        <svg viewBox="0 0 24 24" width="24" height="24"><circle cx="12" cy="12" r="4" fill="currentColor"/><path d="M12-4 L16 8 L8 8" stroke="currentColor" stroke-width="2" fill="none"/></svg>
+        <span>Feed</span>
+      </button>
+      <button class="nav-btn" data-screen="trades">
+        <svg viewBox="0 0 24 24" width="24" height="24"><rect x="4" y="4" width="16" height="12" rx="1" fill="none" stroke="currentColor" stroke-width="1.5"/><line x1="6" y1="8" x2="20" y2="8" stroke="currentColor" stroke-width="1"/><line x1="6" y1="12" x2="20" y2="12" stroke="currentColor" stroke-width="1"/></svg>
+        <span>Trades</span>
+      </button>
+      <button class="nav-btn" data-screen="settings">
+        <svg viewBox="0 0 24 24" width="24" height="24"><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M6 6 L12 12 M12 12 L18 6 M6 18 L12 12 M12 12 L18 18" stroke="currentColor" stroke-width="1.2"/></svg>
+        <span>Settings</span>
+      </button>
+    </nav>
+  </div>
+<script src="/static/script.js"></script>
+<script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', function() {
+      navigator.serviceWorker.register('/static/sw.js').catch(function() {
+        // SW registration failed silently — app still works without it
+      });
+    });
+  }
+</script>
+</body>
+</html>
