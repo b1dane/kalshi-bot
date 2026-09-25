@@ -196,15 +196,20 @@ def run() -> None:
 
                 # ── 4. Paper-execute if Jev said trade ────────────────────
                 if decision.should_trade and decision.direction in ("up", "down"):
-                    trade = executor.execute_trade(
-                        event_ticker=event_ticker,
-                        market_ticker=market_ticker,
-                        direction=decision.direction,
-                        conviction=decision.conviction,
-                        yes_price=yes_price,
-                        no_price=no_price,
-                        target_price=target_price or 0.0,
-                    )
+                    # Check risk limits before executing
+                    allowed, reason = executor.can_trade
+                    if not allowed:
+                        logger.info("Risk gate blocked trade: %s", reason)
+                    else:
+                        trade = executor.execute_trade(
+                            event_ticker=event_ticker,
+                            market_ticker=market_ticker,
+                            direction=decision.direction,
+                            conviction=decision.conviction,
+                            yes_price=yes_price,
+                            no_price=no_price,
+                            target_price=target_price or 0.0,
+                        )
                     if trade:
                         logger.info(
                             "Trade executed: %s %s entry=$%.4f balance=$%.2f",

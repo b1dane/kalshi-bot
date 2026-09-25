@@ -33,6 +33,9 @@ class PaperExecutor:
     """
 
     INITIAL_BALANCE: float = 100.0
+    MAX_BET: float = 5.0          # max $ per trade entry
+    STOP_THRESHOLD: float = 0.75   # +75% PnL locks the bot
+    MIN_TRADE_THRESHOLD: float = 0.30  # +30% PnL required to allow next trade after losses
 
     def __init__(self, state_file: str | None = None):
         self.state_file = state_file or STATE_FILE
@@ -43,6 +46,8 @@ class PaperExecutor:
         self.wins: int = 0
         self.losses: int = 0
         self.balance_history: list[dict[str, Any]] = []  # [{timestamp, balance}, ...]
+        self.bot_locked: bool = False   # locked when +75% PnL hit — manual restart only
+        self.locked_reason: str = ""    # why bot is locked
         self._load_state()
 
     # ── State persistence ──────────────────────────────────────────────────
@@ -64,7 +69,9 @@ class PaperExecutor:
             self.wins = data.get("wins", 0)
             self.losses = data.get("losses", 0)
             self.balance_history = data.get("balance_history", [])
-            logger.info("Paper state loaded: balance=$%.2f, trades=%d", self.balance, self.total_trades)
+            self.bot_locked = data.get("bot_locked", False)
+            self.locked_reason = data.get("locked_reason", "")
+            logger.info("Paper state loaded: balance=$%.2f, trades=%d, locked=%s", self.balance, self.total_trades, self.bot_locked)
         except (json.JSONDecodeError, KeyError, OSError) as exc:
             logger.warning("Could not load paper state (%s), starting fresh", exc)
             self._record_balance()
@@ -79,6 +86,8 @@ class PaperExecutor:
             "wins": self.wins,
             "losses": self.losses,
             "balance_history": self.balance_history,
+            "bot_locked": self.bot_locked,
+            "locked_reason": self.locked_reason,
         }
         with open(self.state_file, "w") as f:
             json.dump(data, f, indent=2)
@@ -86,6 +95,29 @@ class PaperExecutor:
     def _record_balance(self) -> None:
         """Record current balance in history."""
         self.balance_history.append({"timestamp": _utcnow(), "balance": round(self.balance, 2)})
+
+    @property
+    def pnl_ratio(self) -> float:
+        """Profit/loss as a fraction of initial balance (0.75 = +75%)."""
+        return round((self.balance - self.INITIAL_BALANCE) / self.INITIAL_BALANCE, 4)
+
+    @property
+    def can_trade(self) -> tuple[bool, str]:
+        """Check if trading is allowed under all risk limits.
+
+        Returns (allowed, reason). If not allowed, reason explains why.
+        """
+        if self.bot_locked:
+            return False, self.locked_reason or "Bot locked — manual restart required"
+        if self.balance <= 0:
+            return False, "Balance is $0 or less — cannot trade"
+        pnl = self.pnl_ratio
+        if pnl >= self.STOP_THRESHOLD:
+            self.bot_locked = True
+            self.locked_reason = f"+{pnl*100:.0f}% PnL reached — bot stopped per risk rule"
+            self._save_state()
+            return False, self.locked_reason
+        return True, "ok"
 
     # ── Trading ────────────────────────────────────────────────────────────
 
@@ -107,6 +139,18 @@ class PaperExecutor:
             Trade record dict, or None if balance insufficient.
         """
         entry_price = yes_price if direction == "up" else no_price
+
+        # Enforce hard $5 max bet per trade
+        entry_price = min(entry_price, self.MAX_BET)
+        if entry_price <= 0:
+            logger.warning("Empty/invalid entry price — not trading")
+            return None
+
+        # Enforce risk limits (locked, negative balance, +75% stop)
+        allowed, reason = self.can_trade
+        if not allowed:
+            logger.info("Trade blocked: %s", reason)
+            return None
 
         if self.balance < entry_price:
             logger.warning(
@@ -242,10 +286,15 @@ class PaperExecutor:
         return {
             "balance": self.balance,
             "pnl": self.pnl,
+            "pnl_ratio": self.pnl_ratio,
             "total_trades": self.total_trades,
             "wins": self.wins,
             "losses": self.losses,
             "win_rate": self.win_rate,
             "open_positions": self.open_count,
             "initial_balance": self.INITIAL_BALANCE,
+            "bot_locked": self.bot_locked,
+            "locked_reason": self.locked_reason,
+            "max_bet": self.MAX_BET,
+            "stop_threshold_pct": int(self.STOP_THRESHOLD * 100),
         }
