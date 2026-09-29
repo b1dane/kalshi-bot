@@ -1,9 +1,17 @@
 """Kalshi public API client (no authentication needed).
 
-Functions to fetch the latest KXBTC15M event, order books, and recent trades
-from the Kalshi public trade API.
+Fixes vs. the original:
+- Kalshi now returns prices as dollar strings (``yes_ask_dollars: "0.5600"``);
+  the old ``yes_price`` / ``no_price`` fields don't exist, so the bot silently
+  used its 0.50 default for every price.
+- ``GET /markets/{ticker}`` wraps the payload as ``{"market": {...}}`` and the
+  orderbook as ``{"orderbook_fp": {...}}``; the original read the wrapper, so
+  settlement status and order books were never actually found.
+- The target price comes from ``floor_strike`` instead of regexing the title.
 """
+
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -18,11 +26,6 @@ KALSHI_MARKETS_URL = f"{config.KALSHI_BASE_URL}/markets"
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
-
-
-def _utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
 
 def _request(url: str, params: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """Make a GET request; return parsed JSON or None on failure."""
@@ -41,14 +44,62 @@ def _request(url: str, params: dict[str, Any] | None = None) -> dict[str, Any] |
     return None
 
 
+def _f(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _price(market: dict[str, Any], name: str) -> float | None:
+    """Read a price in dollars. Prefers ``<name>_dollars``; falls back to the
+    legacy integer-cents ``<name>`` field."""
+    v = _f(market.get(f"{name}_dollars"))
+    if v is not None:
+        return v
+    v = _f(market.get(name))
+    return v / 100.0 if v is not None else None
+
+
+def parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def get_quote(market: dict[str, Any]) -> dict[str, float | None]:
+    """Normalized prices (dollars) from a market object."""
+    return {
+        "yes_bid": _price(market, "yes_bid"),
+        "yes_ask": _price(market, "yes_ask"),
+        "no_bid": _price(market, "no_bid"),
+        "no_ask": _price(market, "no_ask"),
+        "last": _price(market, "last_price"),
+    }
+
+
+def valid_ask(price: float | None) -> bool:
+    return price is not None and 0.0 < price < 1.0
+
+
+def minutes_left(market: dict[str, Any]) -> float | None:
+    """Minutes until the market closes (settlement window end)."""
+    close = parse_iso(market.get("close_time"))
+    if close is None:
+        return None
+    return (close - datetime.now(timezone.utc)).total_seconds() / 60.0
+
+
 # ── Public API ──────────────────────────────────────────────────────────────
 
-
 def get_current_event() -> dict[str, Any] | None:
-    """Fetch the latest open KXBTC15M event with nested markets.
+    """Fetch the currently-live open KXBTC15M event with nested markets.
 
-    Returns the raw event dict (first/most recent open event) or None.
-    The event contains a ``markets`` list of nested market dicts.
+    If several events are open, pick the one that closes soonest (the live
+    window), not the most recently created.
     """
     params: dict[str, Any] = {
         "series_ticker": config.KALSHI_SERIES,
@@ -58,115 +109,86 @@ def get_current_event() -> dict[str, Any] | None:
     data = _request(KALSHI_EVENTS_URL, params=params)
     if data is None:
         return None
-
     events = data.get("events", [])
     if not events:
         logger.info("No open %s events found", config.KALSHI_SERIES)
         return None
 
-    # Sort by created_at descending, take the most recent
-    events.sort(key=lambda e: e.get("created_at", ""), reverse=True)
-    event = events[0]
-    logger.debug(
-        "Found event %s (tick_size=%s) with %d nested markets",
-        event.get("event_ticker"),
-        event.get("tick_size"),
-        len(event.get("markets", [])),
-    )
-    return event
+    now = datetime.now(timezone.utc)
+    far_future = datetime.max.replace(tzinfo=timezone.utc)
+
+    def next_close(event: dict[str, Any]) -> datetime:
+        closes = [
+            c for c in (parse_iso(m.get("close_time")) for m in event.get("markets", []))
+            if c is not None and c > now
+        ]
+        return min(closes) if closes else far_future
+
+    events.sort(key=next_close)
+    return events[0]
 
 
-def get_order_book(ticker: str, depth: int = 10) -> dict[str, Any] | None:
-    """Fetch order book depth for a market ticker.
+def _levels(raw: Any) -> list[tuple[float, float]]:
+    out: list[tuple[float, float]] = []
+    for lvl in raw or []:
+        try:
+            out.append((float(lvl[0]), float(lvl[1])))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
 
-    Returns dict with ``yes`` and ``no`` sides, each containing
-    lists of {price, count}.
+
+def get_order_book(ticker: str, depth: int = 10) -> dict[str, list[tuple[float, float]]] | None:
+    """Order book as ``{"yes": [(price, qty)...], "no": [...]}`` in dollars.
+
+    Kalshi returns BIDS only, ascending. Levels are sorted best (highest) first.
     """
-    url = f"{KALSHI_MARKETS_URL}/{ticker}/orderbook"
-    data = _request(url, params={"depth": depth})
-    return data
+    data = _request(f"{KALSHI_MARKETS_URL}/{ticker}/orderbook", params={"depth": depth})
+    if not data:
+        return None
+    book = data.get("orderbook_fp") or data.get("orderbook") or {}
+    if "yes_dollars" in book or "no_dollars" in book:
+        yes = _levels(book.get("yes_dollars"))
+        no = _levels(book.get("no_dollars"))
+    else:  # legacy cents format
+        yes = [(p / 100.0, q) for p, q in _levels(book.get("yes"))]
+        no = [(p / 100.0, q) for p, q in _levels(book.get("no"))]
+    yes.sort(reverse=True)
+    no.sort(reverse=True)
+    return {"yes": yes, "no": no}
 
 
 def get_recent_trades(ticker: str, limit: int = 10) -> list[dict[str, Any]]:
-    """Fetch recent trades for a market ticker.
-
-    Returns list of trade dicts (each with price, count, side, etc.).
-    """
-    url = f"{KALSHI_MARKETS_URL}/trades"
-    data = _request(url, params={"ticker": ticker, "limit": limit})
+    """Recent trades for a market ticker (raw dicts)."""
+    data = _request(f"{KALSHI_MARKETS_URL}/trades", params={"ticker": ticker, "limit": limit})
     if data is None:
         return []
     return data.get("trades", [])
 
 
 def get_market(ticker: str) -> dict[str, Any] | None:
-    """Fetch a single market by its ticker (for settlement status, etc.)."""
-    url = f"{KALSHI_MARKETS_URL}/{ticker}"
-    return _request(url)
-
-
-def parse_market_id(event_ticker: str) -> tuple[str, int] | None:
-    """Extract the target price and expiry minute from a KXBTC15M ticker.
-
-    Ticker format: KXBTC15M-26APR100545-45
-    → target price: 1005.45  (divide by 100)
-    → expiry minute offset: 45 (minutes past the hour)
-    """
-    # Format: KXBTC15M-DDMMMHHMMSS-XX
-    import re
-
-    m = re.match(r"KXBTC15M-(\d{2}[A-Z]{3}\d{2})(\d{2})(\d{2})-(\d+)", event_ticker)
-    if m:
-        day_mon_year = m.group(1)  # e.g. 26APR25
-        hour = int(m.group(2))  # e.g. 10
-        minute = int(m.group(3))  # e.g. 05
-        offset = int(m.group(4))  # e.g. 45
-        # target_price in cents from event; we return raw cents
-        return offset, hour, minute, day_mon_year
-    return None
+    """Fetch a single market by ticker. Returns the unwrapped market object."""
+    data = _request(f"{KALSHI_MARKETS_URL}/{ticker}")
+    if data is None:
+        return None
+    return data.get("market", data)
 
 
 def compute_target_price(market: dict[str, Any]) -> float | None:
-    """Extract the target BTC price from a market object.
-
-    The market's title or strike/display fields encode the target.
-    e.g. "Will BTC be below $969.30 at settlement?"
-    """
-    title = market.get("title", "")
-    import re
-
-    # Look for $XXX or XXXXXX patterns
-    m = re.search(r"\$?(\d+[,.]?\d*)", title)
-    if m:
-        raw = m.group(1).replace(",", "")
-        return float(raw)
-
-    # Fallback: from ticker encoding
-    ticker = market.get("ticker", "")
-    try:
-        # e.g. KXBTC15M-26APR100545-45 → 100545 → 1005.45
-        parts = ticker.split("-")
-        if len(parts) >= 3:
-            raw_price = parts[1][-6:]  # last 6 chars before the second dash... wrong logic
-            # Actually format: KXBTC15M-26APR100545-45
-            # Between first and second dash: 26APR100545
-            dash2 = ticker.find("-", ticker.find("-") + 1)
-            if dash2 > 0:
-                code = ticker[len(config.KALSHI_SERIES) + 1 : dash2]
-                # code = 26APR100545
-                # strip the date prefix letters
-                price_chars = ""
-                for ch in code:
-                    if ch.isdigit():
-                        price_chars += ch
-                # price_chars should be like 100545 (6 digits) or 1005455 (7)
-                if len(price_chars) >= 4:
-                    val = float(price_chars) / 100.0
-                    return val
-    except (ValueError, IndexError):
-        pass
-
+    """Strike BTC must finish above for YES, from ``floor_strike``."""
+    for key in ("floor_strike", "cap_strike"):
+        v = _f(market.get(key))
+        if v is not None and v > 0:
+            return v
     return None
+
+
+def parse_market_id(ticker: str) -> dict[str, str] | None:
+    """Split a KXBTC15M ticker like ``KXBTC15M-26SEP291545-45`` into parts."""
+    m = re.match(r"^([A-Z0-9]+)-(\d{2}[A-Z]{3}\d{2})(\d{4})-(\w+)$", ticker)
+    if not m:
+        return None
+    return {"series": m.group(1), "date": m.group(2), "hhmm": m.group(3), "suffix": m.group(4)}
 
 
 def interpret_yes_price(price: float) -> str:
@@ -183,5 +205,4 @@ def interpret_yes_price(price: float) -> str:
         return "likely_down"
     elif price <= 0.45:
         return "leaning_down"
-    else:
-        return "uncertain"
+    return "uncertain"
