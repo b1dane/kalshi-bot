@@ -1,11 +1,14 @@
 """Supabase logger — log every decision and outcome to Supabase tables.
 
-Uses httpx directly to POST to the Supabase REST API.
-Table: kalshi_trades
+Uses httpx directly against the Supabase REST API. Table: kalshi_trades
 
-Auto-creates the table on first use via the Supabase management API.
+Patched:
+- update_settlement() PATCHes the original decision row instead of inserting
+  a second row, so each trade appears once
+- get_stats() uses Prefer: count=exact (the old select=count/limit=0 approach
+  returned nothing and the bare excepts hid it)
+- removed the hardcoded project URL from the warning message
 """
-import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -22,10 +25,7 @@ def _utcnow() -> str:
 
 
 class SupabaseLogger:
-    """Logs trade decisions and outcomes to Supabase.
-
-    Uses the Supabase REST API with service_role key for table operations.
-    """
+    """Logs trade decisions and outcomes to Supabase (service_role key)."""
 
     def __init__(self):
         self.base_url = config.SUPABASE_URL.rstrip("/")
@@ -46,29 +46,19 @@ class SupabaseLogger:
     # ── Table management ───────────────────────────────────────────────────
 
     def ensure_table(self) -> bool:
-        """Ensure the kalshi_trades table exists.
-
-        Attempts to insert a test row; if the table doesn't exist the
-        API returns a 404-like error. We then try to create it via
-        the Supabase management SQL endpoint.
-
-        Returns True if table exists or was created.
-        """
+        """Check that kalshi_trades exists; try to create it if not."""
         if not self._configured:
             logger.warning("Supabase not configured — can't ensure table")
             return False
 
-        # Test: try to query the table (single row)
-        test_url = f"{self._table_url}?limit=1"
         try:
-            resp = httpx.get(test_url, headers=self._headers, timeout=10)
+            resp = httpx.get(f"{self._table_url}?limit=1", headers=self._headers, timeout=10)
             if resp.status_code < 400:
                 logger.info("Supabase table kalshi_trades exists")
                 return True
             if resp.status_code == 404:
                 logger.info("Table kalshi_trades not found — creating...")
                 return self._create_table()
-            # 401/403 means bad key — just log and continue
             if resp.status_code in (401, 403):
                 logger.warning("Supabase auth failed (status=%d) — check SERVICE_KEY", resp.status_code)
                 return False
@@ -79,12 +69,6 @@ class SupabaseLogger:
             return False
 
     def _create_table(self) -> bool:
-        """Create the kalshi_trades table via Supabase SQL endpoint.
-
-        The Supabase REST API does NOT expose DDL (CREATE TABLE) endpoints
-        by default. This method attempts the known approaches and provides
-        clear instructions if they fail.
-        """
         sql = """
         CREATE TABLE IF NOT EXISTS kalshi_trades (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -104,109 +88,100 @@ class SupabaseLogger:
         CREATE INDEX IF NOT EXISTS idx_kalshi_trades_created ON kalshi_trades(created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_kalshi_trades_settled ON kalshi_trades(settled);
         """
-
-        # Attempt 1: rpc/pg_query (custom function, rarely exists by default)
-        query_url = f"{self.base_url}/rest/v1/rpc/pg_query"
-        try:
-            resp = httpx.post(query_url, json={"query": sql}, headers=self._headers, timeout=15)
-            if resp.status_code < 400:
-                logger.info("Supabase table kalshi_trades created via pg_query")
-                return True
-        except httpx.RequestError:
-            pass
-
-        # Attempt 2: /rest/v1/sql with content-type text/plain
-        try:
-            resp = httpx.post(
+        for url, kwargs in (
+            (f"{self.base_url}/rest/v1/rpc/pg_query", {"json": {"query": sql}}),
+            (
                 f"{self.base_url}/rest/v1/sql",
-                content=sql,
-                headers={**self._headers, "Content-Type": "text/plain"},
-                timeout=15,
-            )
-            if resp.status_code < 400:
-                logger.info("Supabase table created via /rest/v1/sql")
-                return True
-        except httpx.RequestError:
-            pass
+                {"content": sql, "headers_extra": {"Content-Type": "text/plain"}},
+            ),
+        ):
+            try:
+                extra = kwargs.pop("headers_extra", {})
+                resp = httpx.post(url, headers={**self._headers, **extra}, timeout=15, **kwargs)
+                if resp.status_code < 400:
+                    logger.info("Supabase table kalshi_trades created")
+                    return True
+            except httpx.RequestError:
+                pass
 
-        # Neither approach works — the Supabase REST API does not expose DDL.
         logger.warning(
-            "Cannot create table via REST API. "
-            "The Supabase REST API does not expose DDL endpoints. "
-            "To create the table, paste the SQL from migration.sql "
-            "into the Supabase dashboard SQL Editor "
-            "(https://supabase.com/dashboard/project/tkssicfcpqwoccidunkv/sql/new)"
+            "Cannot create table via REST API (no DDL endpoint). "
+            "Paste the SQL from migration.sql into the Supabase dashboard SQL Editor."
         )
-        logger.warning(
-            "The bot will continue without Supabase persistence — "
-            "Jev decisions and Kalshi data fetching still work."
-        )
+        logger.warning("The bot will continue without Supabase persistence.")
         return False
 
     # ── Logging ────────────────────────────────────────────────────────────
 
     def log_decision(self, decision_data: dict[str, Any]) -> bool:
-        """Log a single decision/outcome row to Supabase.
-
-        Args:
-            decision_data: Dict with keys matching the table schema:
-                - event_ticker (str)
-                - target_price (float, optional)
-                - prediction (str: up/down/pass)
-                - conviction_score (int: 0-3)
-                - yes_price_at_entry (float, optional)
-                - no_price_at_entry (float, optional)
-                - market_ticker (str, optional)
-                - settled (bool)
-                - was_correct (bool, optional)
-                - pnl (float, optional)
-                - settled_at (str, optional)
-
-        Returns:
-            True if logged successfully or supabase not configured.
-        """
+        """Insert one decision row. Returns True on success or if unconfigured."""
         if not self._configured:
-            logger.debug("Supabase not configured — skipping log")
-            return True  # Not an error, just not configured
+            return True
 
-        # Strip None values (let Supabase use defaults)
         payload = {k: v for k, v in decision_data.items() if v is not None}
-
         try:
             resp = httpx.post(self._table_url, json=payload, headers=self._headers, timeout=10)
             if resp.status_code < 400:
                 return True
-            logger.warning(
-                "Supabase insert returned %d: %.200s",
-                resp.status_code, resp.text,
-            )
+            logger.warning("Supabase insert returned %d: %.200s", resp.status_code, resp.text)
             return False
         except httpx.RequestError as exc:
             logger.warning("Supabase insert error: %s", exc)
             return False
 
-    def log_decision_batch(self, decisions: list[dict[str, Any]]) -> bool:
-        """Log multiple decisions in one batch request.
+    def update_settlement(self, record: dict[str, Any]) -> bool:
+        """Mark the original decision row for this market as settled.
 
-        Args:
-            decisions: List of decision data dicts.
-
-        Returns:
-            True if all logged successfully.
+        Matches the newest unsettled row with the record's market_ticker.
+        If no such row exists (e.g. the original insert failed earlier),
+        falls back to inserting the settled record so the outcome isn't lost.
         """
         if not self._configured:
             return True
-        if not decisions:
+
+        market_ticker = record.get("market_ticker")
+        if not market_ticker:
+            return self.log_decision(record)
+
+        patch = {
+            "settled": True,
+            "was_correct": record.get("was_correct"),
+            "pnl": record.get("pnl"),
+            "settled_at": record.get("settled_at") or _utcnow(),
+        }
+        # was_correct is None for voided markets; JSON null is fine on PATCH
+        params = {
+            "market_ticker": f"eq.{market_ticker}",
+            "settled": "eq.false",
+            "prediction": "in.(up,down)",
+        }
+        try:
+            resp = httpx.patch(
+                self._table_url,
+                params=params,
+                json=patch,
+                headers={**self._headers, "Prefer": "return=representation"},
+                timeout=10,
+            )
+            if resp.status_code < 400:
+                if resp.json():  # at least one row updated
+                    return True
+                logger.info("No open row for %s — inserting settled record", market_ticker)
+                return self.log_decision(record)
+            logger.warning("Supabase settlement update returned %d: %.200s", resp.status_code, resp.text)
+            return False
+        except (httpx.RequestError, ValueError) as exc:
+            logger.warning("Supabase settlement update error: %s", exc)
+            return False
+
+    def log_decision_batch(self, decisions: list[dict[str, Any]]) -> bool:
+        """Insert several decision rows in one request."""
+        if not self._configured or not decisions:
             return True
 
-        # Strip None values from each
         payload = [{k: v for k, v in d.items() if v is not None} for d in decisions]
-
         try:
-            resp = httpx.post(self._table_url, json=payload, headers={
-                **self._headers,
-                "Prefer": "return=minimal",
-            }, timeout=15)
+            resp = httpx.post(self._table_url, json=payload, headers=self._headers, timeout=15)
             if resp.status_code < 400:
                 logger.info("Batch logged %d decisions", len(decisions))
                 return True
@@ -218,57 +193,36 @@ class SupabaseLogger:
 
     # ── Query ──────────────────────────────────────────────────────────────
 
+    def _count(self, params: dict[str, str] | None = None) -> int | None:
+        """Exact row count via Content-Range (works with any PostgREST setup)."""
+        try:
+            resp = httpx.get(
+                self._table_url,
+                headers={**self._headers, "Prefer": "count=exact", "Range-Unit": "items", "Range": "0-0"},
+                params={"select": "id", **(params or {})},
+                timeout=10,
+            )
+            if resp.status_code >= 400:
+                logger.warning("Supabase count returned %d: %.200s", resp.status_code, resp.text)
+                return None
+            # Content-Range looks like "0-0/42" or "*/0"
+            total = resp.headers.get("content-range", "").split("/")[-1]
+            return int(total) if total.isdigit() else None
+        except (httpx.RequestError, ValueError) as exc:
+            logger.warning("Supabase count error: %s", exc)
+            return None
+
     def get_stats(self) -> dict[str, Any]:
-        """Fetch aggregate stats from the Supabase table."""
+        """Aggregate stats from the table."""
         if not self._configured:
             return {"error": "Supabase not configured"}
 
-        stats = {}
-
+        stats: dict[str, Any] = {
+            "total_decisions": self._count(),
+            "settled_trades": self._count({"settled": "eq.true"}),
+            "wins": self._count({"was_correct": "eq.true"}),
+        }
         try:
-            # Total decisions
-            resp = httpx.get(
-                self._table_url,
-                headers={**self._headers, "Prefer": "return=representation"},
-                params={"select": "count", "limit": 0},
-                timeout=10,
-            )
-            if resp.status_code < 400:
-                data = resp.json()
-                stats["total_decisions"] = data[0].get("count", 0) if isinstance(data, list) else 0
-        except Exception:
-            pass
-
-        try:
-            # Settled trades
-            resp = httpx.get(
-                self._table_url,
-                headers={**self._headers, "Prefer": "return=representation"},
-                params={"settled": "eq.true", "select": "count", "limit": 0},
-                timeout=10,
-            )
-            if resp.status_code < 400:
-                data = resp.json()
-                stats["settled_trades"] = data[0].get("count", 0) if isinstance(data, list) else 0
-        except Exception:
-            pass
-
-        try:
-            # Wins
-            resp = httpx.get(
-                self._table_url,
-                headers={**self._headers, "Prefer": "return=representation"},
-                params={"was_correct": "eq.true", "select": "count", "limit": 0},
-                timeout=10,
-            )
-            if resp.status_code < 400:
-                data = resp.json()
-                stats["wins"] = data[0].get("count", 0) if isinstance(data, list) else 0
-        except Exception:
-            pass
-
-        try:
-            # Recent trades
             resp = httpx.get(
                 self._table_url,
                 headers={**self._headers, "Prefer": "return=representation"},
@@ -277,9 +231,8 @@ class SupabaseLogger:
             )
             if resp.status_code < 400:
                 stats["recent_trades"] = resp.json()
-        except Exception:
-            pass
-
+        except (httpx.RequestError, ValueError) as exc:
+            logger.warning("Supabase recent-trades error: %s", exc)
         return stats
 
 
