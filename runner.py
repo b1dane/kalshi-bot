@@ -1,16 +1,16 @@
-"""Main runner loop — checks for new events, calls Jev, logs, paper trades.
+"""Main runner loop — settle, evaluate the live event, ask Jev, paper-trade.
 
-Flow:
-1. Every loop (30s): settle any open positions (every 60s)  <-- moved to top
-2. Poll for new KXBTC15M events
-3. On a new event: fetch market + book + trades, call Jev, log, paper-trade
-4. Run until Ctrl+C
+Flow (every POLL_SECONDS):
+1. Settle any open positions (always, even between events).
+2. Fetch the live KXBTC15M event and its market.
+3. Compute a volatility-model fair price from BTC spot, strike, time left.
+4. If the model shows an edge over the ask (after fees), ask Jev.
+5. Trade only if Jev agrees on direction with conviction >= MIN_CONVICTION.
+   One trade per event, only until MIN_MINUTES_LEFT before close.
 
-Patched:
-- Settlement check no longer skipped by `continue` when no event is open
-- Uses real ASK prices from the market (yes_ask / no_ask), never a fake 0.50
-- Order book normalized ({"orderbook": {"yes": [[price, count]]}} -> dicts)
-- Target price from `floor_strike` when present
+Why re-evaluate every poll instead of once when the event opens: the strike is
+set at the open, so odds start near 50/50 with no edge. Edge shows up later in
+the window, when spot has moved and the market's price hasn't caught up.
 """
 
 import logging
@@ -20,23 +20,35 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from btc_data import get_minute_vol, get_spot
 from config import config
+from jev_decisions import decide_trade
 from kalshi_data import (
     compute_target_price,
     get_current_event,
     get_order_book,
-    get_recent_trades,
+    get_quote,
+    minutes_left,
+    valid_ask,
 )
-from jev_decisions import decide_trade
 from paper_executor import PaperExecutor
+from pricing import fee_per_contract, prob_above
 from supabase_logger import supabase
+
+# ── Tunables ────────────────────────────────────────────────────────────────
+POLL_SECONDS = 30
+SETTLE_CHECK_SECONDS = 60
+MIN_MINUTES_LEFT = 1.5  # don't open trades this close to settlement
+MIN_EDGE = 0.04  # model P minus ask minus fee, in dollars per contract
+MIN_CONVICTION = 1  # Jev conviction floor (0-3)
+JEV_RECHECK_SECONDS = 120  # min gap between Jev calls for the same event
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("runner")
+logger = logging.getLogger("kalshi_bot")
 
 _shutdown = False
 
@@ -53,107 +65,33 @@ signal.signal(signal.SIGTERM, _handle_signal)
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
-def _to_dollars(value: Any) -> float | None:
-    """Convert a Kalshi price to dollars. Handles '0.56' strings and cents ints."""
-    if value is None or value == "":
-        return None
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return None
-    if v > 1.0:  # cents (e.g. 56) -> dollars
-        v /= 100.0
-    return v if 0.0 < v < 1.0 else None
+def _sleep_until(target_time: float) -> None:
+    while not _shutdown and time.time() < target_time:
+        time.sleep(1)
 
 
-def _first_price(market: dict[str, Any], *keys: str) -> float | None:
-    for key in keys:
-        p = _to_dollars(market.get(key))
-        if p is not None:
-            return p
-    return None
-
-
-def get_ask_prices(market: dict[str, Any]) -> tuple[float, float] | None:
-    """Return (yes_ask, no_ask) in dollars, or None if the market has no prices.
-
-    Buying YES costs the YES ask; buying NO costs the NO ask. If one ask is
-    missing, derive it from the opposite bid (yes_ask ~= 1 - no_bid).
-    """
-    yes_ask = _first_price(market, "yes_ask_dollars", "yes_ask")
-    no_ask = _first_price(market, "no_ask_dollars", "no_ask")
-    yes_bid = _first_price(market, "yes_bid_dollars", "yes_bid")
-    no_bid = _first_price(market, "no_bid_dollars", "no_bid")
-
-    if yes_ask is None and no_bid is not None:
-        yes_ask = round(1.0 - no_bid, 4)
-    if no_ask is None and yes_bid is not None:
-        no_ask = round(1.0 - yes_bid, 4)
-
-    if yes_ask is None or no_ask is None:
-        return None
-    return yes_ask, no_ask
-
-
-def normalize_book(order_book: dict[str, Any] | None) -> tuple[list[dict], list[dict]]:
-    """Turn Kalshi's orderbook payload into lists of {"price", "count"} dicts."""
-    if not order_book:
-        return [], []
-    book = order_book.get("orderbook") or order_book.get("orderbook_fp") or order_book
-
-    def _side(levels: Any) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
-        for lvl in levels or []:
-            try:
-                if isinstance(lvl, dict):
-                    price, count = lvl.get("price"), lvl.get("count", 0)
-                else:
-                    price, count = lvl[0], lvl[1]
-                p = _to_dollars(price)
-                if p is not None:
-                    out.append({"price": p, "count": float(count)})
-            except (IndexError, TypeError, ValueError):
-                continue
-        # best (highest) bid first
-        out.sort(key=lambda d: d["price"], reverse=True)
-        return out
-
-    return _side(book.get("yes") or book.get("yes_dollars")), _side(book.get("no") or book.get("no_dollars"))
-
-
-def get_target_price(market: dict[str, Any]) -> float | None:
-    strike = market.get("floor_strike")
-    if strike is None:
-        strike = market.get("cap_strike")
-    if strike is not None:
-        try:
-            return float(strike)
-        except (TypeError, ValueError):
-            pass
-    return compute_target_price(market)  # legacy fallback
-
-
-def _build_decision_record(
-    event: dict[str, Any],
-    market_ticker: str | None,
+def _record(
+    event_ticker: str,
+    market_ticker: str,
     target_price: float | None,
     direction: str,
     conviction: int,
-    yes_price: float,
-    no_price: float,
+    yes_price: float | None,
+    no_price: float | None,
     settled: bool = False,
     was_correct: bool | None = None,
     pnl: float | None = None,
     settled_at: str | None = None,
 ) -> dict[str, Any]:
+    """Row for Supabase logging."""
     return {
-        "event_ticker": event.get("event_ticker", "unknown"),
+        "event_ticker": event_ticker or "unknown",
         "market_ticker": market_ticker or "",
         "target_price": target_price,
         "prediction": direction,
         "conviction_score": conviction,
-        "yes_price_at_entry": round(yes_price, 4),
-        "no_price_at_entry": round(no_price, 4),
+        "yes_price_at_entry": round(yes_price, 4) if yes_price is not None else None,
+        "no_price_at_entry": round(no_price, 4) if no_price is not None else None,
         "settled": settled,
         "was_correct": was_correct,
         "pnl": pnl,
@@ -161,38 +99,163 @@ def _build_decision_record(
     }
 
 
-def _settle_open_positions(executor: PaperExecutor) -> None:
-    """Check settlements and log outcomes. Safe to call on every loop."""
+def _settle(executor: PaperExecutor) -> None:
     settled = executor.check_settlements()
     if not settled:
         return
     for trade in settled:
-        record = _build_decision_record(
-            event={"event_ticker": trade["event_ticker"]},
-            market_ticker=trade["market_ticker"],
-            target_price=trade.get("target_price"),
-            direction=trade["direction"],
-            conviction=trade["conviction"],
-            yes_price=trade["yes_price_at_entry"],
-            no_price=trade["no_price_at_entry"],
-            settled=True,
-            was_correct=trade["was_correct"],
-            pnl=trade["pnl"],
-            settled_at=trade["settled_at"],
+        # Use the settled trade's OWN event ticker (the original used the
+        # current event's, so settlement rows were tagged with the wrong event).
+        supabase.update_settlement(
+            _record(
+                event_ticker=trade["event_ticker"],
+                market_ticker=trade["market_ticker"],
+                target_price=trade.get("target_price"),
+                direction=trade["direction"],
+                conviction=trade["conviction"],
+                yes_price=trade.get("yes_price_at_entry"),
+                no_price=trade.get("no_price_at_entry"),
+                settled=True,
+                was_correct=trade["was_correct"],
+                pnl=trade["pnl"],
+                settled_at=trade["settled_at"],
+            )
         )
-        supabase.update_settlement(record)
     logger.info(
-        "%d trade(s) settled: %d wins, %d losses (win_rate=%.1f%%)",
+        "%d trade(s) settled: %d wins, %d losses | overall win_rate=%.1f%%",
         len(settled),
-        sum(1 for t in settled if t["was_correct"] is True),
-        sum(1 for t in settled if t["was_correct"] is False),
+        sum(1 for t in settled if t["was_correct"]),
+        sum(1 for t in settled if not t["was_correct"]),
         executor.win_rate,
     )
 
 
-def _sleep_until(target_time: float) -> None:
-    while not _shutdown and time.time() < target_time:
-        time.sleep(1)
+def _evaluate(
+    event: dict[str, Any],
+    executor: PaperExecutor,
+    state: dict[str, Any],
+) -> None:
+    """Evaluate the live event once; maybe trade."""
+    event_ticker = event.get("event_ticker", "")
+    markets = event.get("markets", [])
+    if not event_ticker or not markets:
+        return
+    if executor.has_traded_event(event_ticker):
+        return
+
+    allowed, reason = executor.can_trade
+    if not allowed:
+        if state.get("last_block") != reason:
+            logger.info("Risk gate: %s", reason)
+            state["last_block"] = reason
+        return
+
+    market = markets[0]
+    market_ticker = market.get("ticker", "")
+    strike = compute_target_price(market)
+    mins = minutes_left(market)
+    if strike is None or mins is None:
+        if state.get("warned_event") != event_ticker:
+            logger.warning("%s: missing strike/close_time — skipping", event_ticker)
+            state["warned_event"] = event_ticker
+        return
+    if mins < MIN_MINUTES_LEFT:
+        return
+
+    quote = get_quote(market)
+    yes_ask, no_ask = quote["yes_ask"], quote["no_ask"]
+    if not (valid_ask(yes_ask) and valid_ask(no_ask)):
+        logger.debug("%s: no valid asks yet", market_ticker)
+        return
+
+    spot = get_spot()
+    vol = get_minute_vol()
+    p_yes = prob_above(spot, strike, mins, vol)
+    if p_yes is None:
+        logger.debug("%s: model inputs unavailable", market_ticker)
+        return
+
+    edge_yes = p_yes - yes_ask - fee_per_contract(yes_ask)
+    edge_no = (1.0 - p_yes) - no_ask - fee_per_contract(no_ask)
+    if edge_yes >= edge_no:
+        direction, edge, ask = "up", edge_yes, yes_ask
+    else:
+        direction, edge, ask = "down", edge_no, no_ask
+
+    if edge < MIN_EDGE:
+        logger.debug(
+            "%s: no edge (best=%s %.3f, p_yes=%.3f, yes_ask=%.2f no_ask=%.2f, %.1f min left)",
+            market_ticker, direction, edge, p_yes, yes_ask, no_ask, mins,
+        )
+        return
+
+    # Candidate found — rate-limit Jev calls for this event.
+    last_call = state.setdefault("jev_calls", {}).get(event_ticker, 0.0)
+    if time.time() - last_call < JEV_RECHECK_SECONDS:
+        return
+    state["jev_calls"][event_ticker] = time.time()
+
+    book = get_order_book(market_ticker) or {"yes": [], "no": []}
+    ctx = {
+        "spot": spot,
+        "strike": strike,
+        "minutes_left": mins,
+        "minute_vol": vol,
+        "p_yes_model": p_yes,
+        "yes_ask": yes_ask,
+        "no_ask": no_ask,
+        "order_book_yes": book["yes"],
+        "order_book_no": book["no"],
+    }
+    logger.info(
+        "%s: model edge %.3f on %s (p_yes=%.3f, ask=%.2f, %.1f min left) — asking Jev",
+        market_ticker, edge, direction.upper(), p_yes, ask, mins,
+    )
+    decision = decide_trade(event, ctx)
+
+    def log_row(prediction: str) -> None:
+        supabase.log_decision(
+            _record(
+                event_ticker, market_ticker, strike, prediction,
+                decision.conviction, yes_ask, no_ask,
+            )
+        )
+
+    # Rows with prediction up/down represent ACTUAL paper trades (one per event).
+    # Everything else is logged as "pass" so update_settlement never matches it.
+    if not decision.should_trade or decision.direction != direction:
+        log_row("pass")
+        logger.info(
+            "No trade: Jev said %s (trade=%s) vs model %s",
+            decision.direction, decision.should_trade, direction,
+        )
+        return
+    if decision.conviction < MIN_CONVICTION:
+        log_row("pass")
+        logger.info("No trade: conviction %d below floor %d", decision.conviction, MIN_CONVICTION)
+        return
+
+    trade = executor.execute_trade(
+        event_ticker=event_ticker,
+        market_ticker=market_ticker,
+        direction=direction,
+        conviction=decision.conviction,
+        entry_price=ask,
+        target_price=strike,
+        yes_price=yes_ask,
+        no_price=no_ask,
+        p_model=p_yes,
+        edge=edge,
+    )
+    if trade:
+        log_row(direction)
+        logger.info(
+            "Trade executed: %s %d x %s @ $%.2f balance=$%.2f",
+            direction.upper(), trade["contracts"], market_ticker,
+            trade["entry_price"], executor.balance,
+        )
+    else:
+        log_row("pass")
 
 
 # ── Main loop ───────────────────────────────────────────────────────────────
@@ -200,8 +263,14 @@ def _sleep_until(target_time: float) -> None:
 def run() -> None:
     logger.info("=" * 60)
     logger.info("Kalshi BTC 15-min Paper Trading Bot starting...")
-    logger.info("Config: %s", config)
     logger.info("=" * 60)
+
+    for notice in getattr(config, "notices", []):
+        logger.warning(notice)
+
+    if not config.jev_configured:
+        logger.error("Jev API key is not configured (set TYPESAFE_API_KEY). Exiting.")
+        sys.exit(1)
 
     if supabase.ready:
         supabase.ensure_table()
@@ -209,9 +278,8 @@ def run() -> None:
         logger.warning("Supabase not configured — decisions will not be persisted")
 
     executor = PaperExecutor()
-    last_event_id: str | None = None
-    last_settlement_check: float = 0.0
-
+    state: dict[str, Any] = {}
+    last_settle_check = 0.0
     logger.info(
         "Starting with balance=$%.2f, %d open positions",
         executor.balance, executor.open_count,
@@ -219,118 +287,29 @@ def run() -> None:
     logger.info("Runner is live. Press Ctrl+C to stop.")
 
     while not _shutdown:
-        loop_start = time.time()
+        now = time.time()
         try:
-            # ── 1. Settlement FIRST, so nothing below can skip it ──────────
-            if executor.open_count > 0 and (loop_start - last_settlement_check) >= 60:
-                _settle_open_positions(executor)
-                last_settlement_check = loop_start
+            # 1. Settlement runs every cycle, regardless of whether an event is live.
+            if executor.open_count > 0 and now - last_settle_check >= SETTLE_CHECK_SECONDS:
+                _settle(executor)
+                last_settle_check = now
 
-            # ── 2. Look for a new event ────────────────────────────────────
+            # 2. Evaluate the live event.
             event = get_current_event()
-            if event is None:
-                logger.debug("No open %s events — waiting...", config.KALSHI_SERIES)
-                _sleep_until(loop_start + 30)
-                continue
-
-            event_ticker = event.get("event_ticker", "")
-            event_id = event.get("id", event_ticker)
-
-            if event_id == last_event_id:
-                _sleep_until(loop_start + 30)
-                continue
-
-            logger.info("New event detected: %s", event_ticker)
-
-            markets = event.get("markets", [])
-            if not markets:
-                logger.warning("Event %s has no markets — will retry", event_ticker)
-                _sleep_until(loop_start + 30)
-                continue  # last_event_id NOT set, so we retry next loop
-
-            primary_market = markets[0]
-            market_ticker = primary_market.get("ticker", "")
-
-            prices = get_ask_prices(primary_market)
-            if prices is None:
-                logger.warning(
-                    "No usable prices on %s (keys: %s) — skipping event",
-                    market_ticker, sorted(primary_market.keys()),
-                )
-                last_event_id = event_id  # don't spam-retry a dead event
-                _sleep_until(loop_start + 30)
-                continue
-            yes_price, no_price = prices
-            last_event_id = event_id
-
-            order_book_yes, order_book_no = normalize_book(get_order_book(market_ticker))
-            trades = get_recent_trades(market_ticker)
-            target_price = get_target_price(primary_market)
-
-            price_context = {
-                "yes_price": yes_price,
-                "no_price": no_price,
-                "order_book_yes": order_book_yes,
-                "order_book_no": order_book_no,
-                "recent_trades": trades,
-                "market_ticker": market_ticker,
-                "target_price": target_price,
-            }
-
-            # ── 3. Jev decision ────────────────────────────────────────────
-            logger.info("Calling Jev for %s...", market_ticker)
-            decision = decide_trade(event, price_context)
-
-            # ── 4. Log decision ────────────────────────────────────────────
-            supabase.log_decision(
-                _build_decision_record(
-                    event=event,
-                    market_ticker=market_ticker,
-                    target_price=target_price,
-                    direction=decision.direction,
-                    conviction=decision.conviction,
-                    yes_price=yes_price,
-                    no_price=no_price,
-                )
-            )
-
-            # ── 5. Paper-execute ───────────────────────────────────────────
-            if decision.should_trade and decision.direction in ("up", "down"):
-                allowed, reason = executor.can_trade
-                if not allowed:
-                    logger.info("Risk gate blocked trade: %s", reason)
-                else:
-                    trade = executor.execute_trade(
-                        event_ticker=event_ticker,
-                        market_ticker=market_ticker,
-                        direction=decision.direction,
-                        conviction=decision.conviction,
-                        yes_price=yes_price,
-                        no_price=no_price,
-                        target_price=target_price or 0.0,
-                    )
-                    if trade:
-                        logger.info(
-                            "Trade executed: %s %s %dx @ $%.4f balance=$%.2f",
-                            decision.direction.upper(), market_ticker,
-                            trade["contracts"], trade["entry_price"], executor.balance,
-                        )
-                    else:
-                        logger.info("Trade declined (insufficient balance or bad price)")
-            else:
-                logger.info("No trade: %s (conviction=%d)", decision.direction, decision.conviction)
-
-            _sleep_until(loop_start + 30)
-
+            if event is not None:
+                if state.get("event") != event.get("event_ticker"):
+                    state["event"] = event.get("event_ticker")
+                    logger.info("Live event: %s", state["event"])
+                _evaluate(event, executor, state)
         except Exception:
             logger.exception("Unexpected error in main loop — continuing")
-            _sleep_until(time.time() + 30)
+        _sleep_until(now + POLL_SECONDS)
 
     logger.info("Shutting down.")
-    status = executor.get_status_summary()
+    s = executor.get_status_summary()
     logger.info(
-        "Final: balance=$%.2f pnl=$%.2f trades=%d win_rate=%.1f%%",
-        status["balance"], status["pnl"], status["total_trades"], status["win_rate"],
+        "Final: balance=$%.2f equity=$%.2f pnl=$%.2f trades=%d win_rate=%.1f%%",
+        s["balance"], s["equity"], s["pnl"], s["total_trades"], s["win_rate"],
     )
     sys.exit(0)
 
