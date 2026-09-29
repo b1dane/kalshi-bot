@@ -1,114 +1,112 @@
-"""CLI status reporter — shows paper balance, win rate, recent trades, Jev stats.
+"""CLI status reporter — paper equity, win rate, recent trades, Supabase stats.
 
 Usage:
     python3.11 status.py           # Full status
     python3.11 status.py --json    # JSON output (for scripting)
+
+Layout is kept under ~44 columns so it doesn't wrap on a phone terminal.
 """
 import argparse
 import json
-import sys
 
 from config import config
 from paper_executor import PaperExecutor
 from supabase_logger import supabase
 
-
-def fmt_price(p: float) -> str:
-    return f"${p:.4f}"
+RULE = "─" * 42
 
 
-def fmt_dollar(p: float) -> str:
-    return f"${p:,.2f}"
+def fmt_dollar(x: float) -> str:
+    return f"${x:,.2f}"
+
+
+def fmt_signed(x: float) -> str:
+    return f"{'+' if x >= 0 else '-'}${abs(x):,.2f}"
+
+
+def _bot_state(executor: PaperExecutor) -> str:
+    """Why the bot is (or isn't) trading. Read-only: never triggers a lock."""
+    if executor.bot_locked:
+        return f"LOCKED — {executor.locked_reason or 'manual restart required'}"
+    if executor.realized_pnl_today() <= -executor.DAILY_LOSS_LIMIT:
+        return f"PAUSED — daily loss limit (${executor.DAILY_LOSS_LIMIT:.0f}) hit"
+    return "ACTIVE"
+
+
+def _realized(executor: PaperExecutor) -> tuple[float, int]:
+    """Total realized P&L and count over settled trades."""
+    pnls = [
+        t["pnl"] for t in executor.trade_history
+        if t.get("settled") and t.get("pnl") is not None
+    ]
+    return sum(pnls), len(pnls)
 
 
 def show_status(json_output: bool = False) -> None:
-    """Display bot status."""
     executor = PaperExecutor()
     stats = executor.get_status_summary()
 
     if json_output:
-        data = {
+        realized, n_settled = _realized(executor)
+        print(json.dumps({
             **stats,
+            "state": _bot_state(executor),
+            "realized_pnl": round(realized, 2),
+            "realized_pnl_today": round(executor.realized_pnl_today(), 2),
+            "settled_trades": n_settled,
             "config": repr(config),
             "jev_configured": config.jev_configured,
             "supabase_configured": config.supabase_configured,
-        }
-        print(json.dumps(data, indent=2))
+        }, indent=2))
         return
 
-    # ── Header ─────────────────────────────────────────────────────────────
-    border = "─" * 58
+    realized, n_settled = _realized(executor)
+    today = executor.realized_pnl_today()
+
     print()
-    print(f"  ╔{border}╗")
-    print(f"  ║  Kalshi BTC 15-min Paper Trading Bot    ║")
-    print(f"  ╚{border}╝")
-    print()
+    print("  Kalshi BTC 15-min Paper Bot")
+    print(f"  {RULE}")
+    print(f"  Series    {config.KALSHI_SERIES}")
+    print(f"  Jev       {'✓' if config.jev_configured else '✗ not configured'}")
+    print(f"  Supabase  {'✓' if config.supabase_configured else '✗ not configured'}")
+    print(f"  State     {_bot_state(executor)}")
+    print(f"  {RULE}")
 
-    # ── Configuration ──────────────────────────────────────────────────────
-    print(f"  📡 Kalshi:   {config.KALSHI_BASE_URL}")
-    print(f"  🧠 Jev API:  {'✓ Configured' if config.jev_configured else '✗ Not configured'}")
-    print(f"  🗄️ Supabase: {'✓ Configured' if config.supabase_configured else '✗ Not configured'}")
-    print(f"  📊 Series:   {config.KALSHI_SERIES}")
-    print()
+    print(f"  Equity     {fmt_dollar(stats['equity']):>11}  ({fmt_signed(stats['pnl'])})")
+    print(f"  Cash       {fmt_dollar(stats['balance']):>11}")
+    print(f"  Open       {stats['open_positions']:>3} pos / {fmt_dollar(executor.open_cost)}")
+    print(f"  Trades     {stats['total_trades']:>3}  (W {stats['wins']} / L {stats['losses']}, "
+          f"{stats['win_rate']:.1f}%)")
+    if n_settled:
+        print(f"  Avg P&L    {fmt_signed(realized / n_settled):>11}  per settled trade")
+    print(f"  Today      {fmt_signed(today):>11}  (limit -{fmt_dollar(executor.DAILY_LOSS_LIMIT)})")
+    print(f"  {RULE}")
 
-    # ── Account ────────────────────────────────────────────────────────────
-    print(f"  ┌{' Account Status ':-^56}┐")
-    print(f"  │ {'Initial Balance':<30} {fmt_dollar(stats['initial_balance']):>20} │")
-    print(f"  │ {'Current Balance':<30} {fmt_dollar(stats['balance']):>20} │")
-    print(f"  │ {'PnL':<30} {fmt_dollar(stats['pnl']):>20} │")
-    print(f"  │ {'Total Trades':<30} {stats['total_trades']:>20} │")
-    print(f"  │ {'Wins':<30} {stats['wins']:>20} │")
-    print(f"  │ {'Losses':<30} {stats['losses']:>20} │")
-    print(f"  │ {'Win Rate':<30} {stats['win_rate']:>19.1f}% │")
-
-    if stats["total_trades"] > 0:
-        avg_pnl = stats["pnl"] / stats["total_trades"]
-        print(f"  │ {'Avg PnL / Trade':<30} {fmt_dollar(avg_pnl):>20} │")
-
-    print(f"  │ {'Open Positions':<30} {stats['open_positions']:>20} │")
-    print(f"  └{'':─^56}┘")
-    print()
-
-    # ── Recent trades ──────────────────────────────────────────────────────
     recent = executor.recent_trades(10)
     if recent:
-        print(f"  ┌{' Recent Trades ':-^56}┐")
-        print(f"  │ {'Time':<20} {'Market':<18} {'Dir':<5} {'Price':<8} {'Outcome':<8} │")
-        print(f"  ├{'':─^20}┬{'':─^18}┬{'':─^5}┬{'':─^8}┬{'':─^8}┤")
-
-        for trade in recent:
-            t = trade["entry_time"][11:19] if len(trade["entry_time"]) > 19 else trade["entry_time"]
-            market = trade["market_ticker"][-12:] if len(trade["market_ticker"]) > 12 else trade["market_ticker"]
-            d = trade["direction"].upper()[:4]
-            p = fmt_price(trade["entry_price"])
-
-            if trade["settled"]:
-                outcome = "✅ WIN" if trade["was_correct"] else "❌ LOSS"
+        print("  Recent trades")
+        for t in recent:
+            when = str(t.get("entry_time", ""))[11:16]
+            direction = str(t.get("direction", "?")).upper()[:4]
+            n = int(t.get("contracts", 1))
+            price = t.get("entry_price", 0.0)
+            if t.get("settled"):
+                outcome = "WIN " if t.get("was_correct") else "LOSS"
+                tail = f"{outcome} {fmt_signed(t.get('pnl') or 0.0)}"
             else:
-                outcome = "⏳ open"
+                tail = "open"
+            print(f"  {when} {direction:<4} {n:>3}x @{price:.2f}  {tail}")
+        print(f"  {RULE}")
 
-            print(f"  │ {t:<20} {market:<18} {d:<5} {p:<8} {outcome:<8} │")
-
-        print(f"  └{'':─^20}┴{'':─^18}┴{'':─^5}┴{'':─^8}┴{'':─^8}┘")
-        print()
-
-    # ── Supabase stats ────────────────────────────────────────────────────
     if config.supabase_configured:
-        db_stats = supabase.get_stats()
-        db_total = db_stats.get("total_decisions", "?")
-        db_settled = db_stats.get("settled_trades", "?")
-        db_wins = db_stats.get("wins", "?")
+        db = supabase.get_stats()
+        print("  Supabase log")
+        print(f"  Decisions  {str(db.get('total_decisions', '?')):>6}")
+        print(f"  Settled    {str(db.get('settled_trades', '?')):>6}")
+        print(f"  Wins       {str(db.get('wins', '?')):>6}")
+        print(f"  {RULE}")
 
-        print(f"  ┌{' Supabase Stats ':-^56}┐")
-        print(f"  │ {'Total Decisions Logged':<30} {str(db_total):>20} │")
-        print(f"  │ {'Settled Trades':<30} {str(db_settled):>20} │")
-        print(f"  │ {'Wins (from DB)':<30} {str(db_wins):>20} │")
-        print(f"  └{'':─^56}┘")
-        print()
-
-    # ── Footer ─────────────────────────────────────────────────────────────
-    print(f"  To start the bot: python3.11 runner.py")
-    print(f"  Press Ctrl+C to stop.")
+    print("  Start: python3.11 runner.py  (Ctrl+C to stop)")
     print()
 
 
