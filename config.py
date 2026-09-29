@@ -1,20 +1,24 @@
 """Environment-based configuration loader.
 
-Sources:
-  - Kalshi base URL (public, no auth needed)
-  - Jev API key from TYPESAFE_API_KEY env var
-  - Supabase creds from SUPABASE_URL / SUPABASE_SERVICE_KEY env vars,
-    or auto-loaded from ~/workspace/leadflow/.env
+Secrets are resolved in this order (first non-empty wins):
+  1. Real environment variables
+  2. ./.env next to this file (kalshi-bot's own .env)
+  3. Fallback .env files from OTHER projects (compat only; a notice is logged
+     whenever a value is taken from one, because that couples this bot to
+     another project's credentials, e.g. paper trades landing in LeadFlow's
+     Supabase project).
 """
 import os
-import re
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_LOCAL_ENV = os.path.join(_HERE, ".env")
+_LEADFLOW_ENV = os.path.expanduser("~/workspace/leadflow/.env")
+_HERMES_ENV = os.path.expanduser("~/.hermes/.env")
 
 
-def _load_dotenv(path: str | None = None) -> dict[str, str]:
-    """Load key=value pairs from a .env file, returning a dict."""
-    if path is None:
-        path = os.path.expanduser("~/workspace/leadflow/.env")
-    env = {}
+def _load_dotenv(path: str) -> dict[str, str]:
+    """Load KEY=value pairs from a .env file (supports `export KEY=value`)."""
+    env: dict[str, str] = {}
     if not os.path.isfile(path):
         return env
     with open(path) as f:
@@ -22,6 +26,8 @@ def _load_dotenv(path: str | None = None) -> dict[str, str]:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
+            if line.startswith("export "):
+                line = line[len("export "):]
             k, v = line.split("=", 1)
             env[k.strip()] = v.strip().strip("\"'")
     return env
@@ -43,31 +49,41 @@ class Config:
     SUPABASE_SERVICE_KEY: str = ""
 
     def __init__(self):
-        # Try local kalshi-bot/.env first, then LeadFlow's .env, then hermes .env
-        local_dotenv = _load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
-        dotenv = _load_dotenv()
-        hermes_dotenv = _load_dotenv(os.path.expanduser("~/.hermes/.env"))
+        self.notices: list[str] = []
+        local = _load_dotenv(_LOCAL_ENV)
+        leadflow = _load_dotenv(_LEADFLOW_ENV)
+        hermes = _load_dotenv(_HERMES_ENV)
 
-        self.JEV_API_KEY = (
-            os.environ.get("TYPESAFE_API_KEY")
-            or local_dotenv.get("TYPESAFE_API_KEY", "")
-            or dotenv.get("TYPESAFE_API_KEY", "")
-            or hermes_dotenv.get("TYPESAFE_API_KEY", "")
+        self.JEV_API_KEY = self._resolve(
+            "TYPESAFE_API_KEY", local, [("LeadFlow", leadflow), ("Hermes", hermes)]
         )
-        self.SUPABASE_URL = (
-            os.environ.get("SUPABASE_URL")
-            or local_dotenv.get("SUPABASE_URL", "")
-            or dotenv.get("SUPABASE_URL", "")
+        self.SUPABASE_URL = self._resolve(
+            "SUPABASE_URL", local, [("LeadFlow", leadflow)]
         )
-        self.SUPABASE_SERVICE_KEY = (
-            os.environ.get("SUPABASE_SERVICE_KEY")
-            or local_dotenv.get("SUPABASE_SERVICE_KEY", "")
-            or dotenv.get("SUPABASE_SERVICE_KEY", "")
+        self.SUPABASE_SERVICE_KEY = self._resolve(
+            "SUPABASE_SERVICE_KEY", local, [("LeadFlow", leadflow)]
         )
 
-        # Override JEV_API_URL from env if set
         self.JEV_API_URL = os.environ.get("JEV_API_URL") or self.JEV_API_URL
         self.KALSHI_BASE_URL = os.environ.get("KALSHI_BASE_URL") or self.KALSHI_BASE_URL
+
+    def _resolve(
+        self,
+        name: str,
+        local: dict[str, str],
+        fallbacks: list[tuple[str, dict[str, str]]],
+    ) -> str:
+        value = os.environ.get(name) or local.get(name, "")
+        if value:
+            return value
+        for label, env in fallbacks:
+            if env.get(name):
+                self.notices.append(
+                    f"{name} was loaded from {label}'s .env, not kalshi-bot's own .env. "
+                    f"Put it in {_LOCAL_ENV} to decouple this bot."
+                )
+                return env[name]
+        return ""
 
     @property
     def jev_configured(self) -> bool:
