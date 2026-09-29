@@ -1,14 +1,19 @@
 """Jev decision engine — batched three-question call to typesafe.ai.
 
 Asks ALL THREE questions in ONE API call:
-  - choice: which_direction (up / down / pass)
-  - score:  conviction (0=none, 1=low, 2=medium, 3=high)
-  - noul:  should_trade (yes / no)
+- choice: which_direction (up / down / pass)
+- score: conviction (0=none, 1=low, 2=medium, 3=high)
+- noul: should_trade (probability -> thresholded)
 
-Returns a structured DecisionResult dataclass.
+Fixes vs. the original: the prompt now includes BTC spot, the strike, distance,
+time left, realized volatility and the real ask prices. Before, Jev only saw
+Kalshi's own prices (which were also wrong), so it had no information to
+predict anything with.
 """
+
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -25,10 +30,11 @@ class DecisionResult:
 
     direction: str  # "up" | "down" | "pass"
     conviction: int  # 0-3
-    should_trade: bool  # True if Jev says trade
+    should_trade: bool
     raw_response: str = ""
     parse_errors: list[str] = field(default_factory=list)
     reasoning: str = ""
+    p_up: float | None = None  # Jev's P(up) among up/down, if provided
 
     @property
     def valid(self) -> bool:
@@ -40,262 +46,189 @@ class DecisionResult:
         return f"{self.direction.upper()} (conviction={self.conviction})"
 
 
-# ── Prompt template ─────────────────────────────────────────────────────────
+# ── Prompt ──────────────────────────────────────────────────────────────────
+
+def _n(value: float | None, fmt: str) -> str:
+    return format(value, fmt) if value is not None else "n/a"
 
 
-def _build_prompt(
-    event_data: dict[str, Any],
-    price_context: dict[str, Any],
-) -> str:
-    """Build a focused prompt from event data and market context."""
+def _best_bid(levels: list[tuple[float, float]]) -> str:
+    if not levels:
+        return "none"
+    price, qty = levels[0]
+    return f"{qty:g} @ ${price:.2f}"
 
-    # Extract relevant fields
-    event_ticker = event_data.get("event_ticker", "unknown")
-    markets = event_data.get("markets", [])
-    tick_size = event_data.get("tick_size", 0)
 
-    yes_price = price_context.get("yes_price", 0.50)
-    no_price = price_context.get("no_price", 0.50)
-    order_book_yes = price_context.get("order_book_yes", [])
-    order_book_no = price_context.get("order_book_no", [])
-    recent_trades = price_context.get("recent_trades", [])
-    mid_price = (yes_price + no_price) / 2
+def _build_prompt(event_data: dict[str, Any], ctx: dict[str, Any]) -> str:
+    """Build a focused prompt from real market + BTC context."""
+    spot = ctx.get("spot")
+    strike = ctx.get("strike")
+    dist_usd = (spot - strike) if spot is not None and strike is not None else None
+    dist_pct = (dist_usd / strike * 100.0) if dist_usd is not None and strike else None
+    vol = ctx.get("minute_vol")
 
-    # Market overview
-    market_info_lines = [
-        f"Event: {event_ticker}",
-        f"Tick size: {tick_size}",
-        f"Number of sub-markets: {len(markets)}",
+    lines = [
+        f"Event: {event_data.get('event_ticker', 'unknown')} (BTC 15-minute up/down)",
+        f"BTC spot (Coinbase): ${_n(spot, ',.2f')}",
+        f"Strike: ${_n(strike, ',.2f')} (YES wins if BTC settles ABOVE this)",
+        f"Spot vs strike: {_n(dist_usd, '+,.2f')} USD ({_n(dist_pct, '+.3f')}%)",
+        f"Minutes to settlement: {_n(ctx.get('minutes_left'), '.1f')}",
+        f"Recent 1-min realized volatility: {_n(vol * 100 if vol else None, '.4f')}%",
+        f"Volatility-model P(BTC above strike): {_n(ctx.get('p_yes_model'), '.3f')}",
+        f"YES ask: ${_n(ctx.get('yes_ask'), '.2f')}   NO ask: ${_n(ctx.get('no_ask'), '.2f')}",
+        f"Best YES bid: {_best_bid(ctx.get('order_book_yes', []))}",
+        f"Best NO bid: {_best_bid(ctx.get('order_book_no', []))}",
     ]
 
-    if markets:
-        for i, m in enumerate(markets[:5]):  # first 5 markets max
-            market_info_lines.append(
-                f"  Market {i+1}: {m.get('ticker','?')} — {m.get('title','?')} "
-                f"(yes={m.get('yes_price', '?')}, no={m.get('no_price', '?')})"
-            )
-
-    price_lines = [
-        f"Current YES price: ${yes_price:.4f}",
-        f"Current NO price:  ${no_price:.4f}",
-        f"Mid price:         ${mid_price:.4f}",
-    ]
-
-    if order_book_yes:
-        best_yes = order_book_yes[0]
-        price_lines.append(f"Best bid (YES): {best_yes.get('count',0)} @ ${best_yes.get('price',0):.4f}")
-    if order_book_no:
-        best_no = order_book_no[0]
-        price_lines.append(f"Best ask (NO):  {best_no.get('count',0)} @ ${best_no.get('price',0):.4f}")
-
-    if recent_trades:
-        last_trade = recent_trades[0]
-        price_lines.append(
-            f"Last trade: {last_trade.get('side','?')} {last_trade.get('count',0)} "
-            f"@ ${last_trade.get('price',0):.4f}"
-        )
-
-    prompt = (
-        "You are a BTC 15-minute binary options trader on Kalshi. "
-        "Analyze the market data below and decide whether to trade.\n\n"
-        "Market:\n" + "\n".join(market_info_lines) + "\n\n"
-        "Prices:\n" + "\n".join(price_lines) + "\n\n"
-        "Rules:\n"
-        "- YES = BTC will be ABOVE the target price at settlement\n"
-        "- NO  = BTC will be BELOW the target price at settlement\n"
-        "- You buy at the YES price; if correct you get $1, if wrong $0\n"
-        "- The YES price is the implied probability (0.50 = 50%)\n\n"
-        "You must answer ALL three questions in one response.\n"
-        "Response format (JSON):\n"
-        "{\n"
-        '  "direction": "up" | "down" | "pass",\n'
-        '  "conviction": 0 | 1 | 2 | 3,\n'
-        '  "should_trade": true | false,\n'
-        '  "reasoning": "brief explanation"\n'
-        "}"
+    return (
+        "You are evaluating one Kalshi BTC 15-minute binary contract.\n\n"
+        + "\n".join(lines)
+        + "\n\nRules:\n"
+        "- Buying YES costs the YES ask and pays $1 if BTC settles above the strike.\n"
+        "- Buying NO costs the NO ask and pays $1 if BTC settles below the strike.\n"
+        "- Kalshi charges a taker fee of roughly 7% x price x (1 - price) per contract.\n"
+        "- Only pick a direction if you believe its true probability exceeds its ask "
+        "by more than fees. If unsure, answer pass.\n"
     )
-    return prompt
 
 
 # ── Jev API call (typed-decision format) ────────────────────────────────────
 
+_QUESTIONS: dict[str, Any] = {
+    "direction": {
+        "type": "choice",
+        "options": ["up", "down", "pass"],
+        "criteria": {
+            "up": "BTC will settle ABOVE the strike and YES is underpriced after fees",
+            "down": "BTC will settle BELOW the strike and NO is underpriced after fees",
+            "pass": "No clear edge after fees, skip this market",
+        },
+        "instructions": "Which side, if any, has positive expected value?",
+    },
+    "conviction": {
+        "type": "score",
+        "levels": ["none", "low", "medium", "high"],
+        "criteria": [
+            "No signal or conflicting indicators",
+            "Weak directional bias, low confidence",
+            "Moderate confidence in predicted direction",
+            "Strong conviction in predicted direction",
+        ],
+        "instructions": "How confident are you in this prediction?",
+    },
+    "should_trade": {
+        "type": "noul",
+        "instructions": "Should we execute a paper trade based on this prediction?",
+    },
+}
 
-def _call_jev(prompt: str) -> dict[str, Any] | None:
-    """Make a single batched call to the Jev /systemone typed-decision API.
 
-    Sends all three questions (direction, conviction, should_trade) as
-    typed questions in a single call using the Jev typed-decision format.
-    The API returns calibrated probabilities for each question.
+def _call_jev(prompt: str, attempts: int = 2) -> dict[str, Any] | None:
+    """Single batched call to the Jev /systemone typed-decision API.
 
-    Returns the parsed JSON dict (the 'answers' dict) or None on failure.
+    Retries once on timeouts/network errors. Returns the 'answers' dict or None.
     """
     if not config.jev_configured:
-        logger.warning("Jev API key not configured — cannot call Jev")
+        logger.error("Jev API key not configured — cannot call Jev")
         return None
 
     headers = {
         "Authorization": f"Bearer {config.JEV_API_KEY}",
         "Content-Type": "application/json",
     }
+    payload = {"model": "jev-latest", "state": prompt, "questions": _QUESTIONS}
 
-    payload = {
-        "model": "jev-latest",
-        "state": prompt,
-        "questions": {
-            "direction": {
-                "type": "choice",
-                "options": ["up", "down", "pass"],
-                "criteria": {
-                    "up": "BTC will settle ABOVE the target price at settlement",
-                    "down": "BTC will settle BELOW the target price at settlement",
-                    "pass": "Not enough signal, skip this event",
-                },
-                "instructions": "Predict the direction of the next Kalshi BTC 15-min event.",
-            },
-            "conviction": {
-                "type": "score",
-                "levels": ["none", "low", "medium", "high"],
-                "criteria": [
-                    "No signal or conflicting indicators",
-                    "Weak directional bias, low confidence",
-                    "Moderate confidence in predicted direction",
-                    "Strong conviction in predicted direction",
-                ],
-                "instructions": "How confident are you in this prediction?",
-            },
-            "should_trade": {
-                "type": "noul",
-                "instructions": "Should we execute a paper trade based on this prediction?",
-            },
-        },
-    }
-
-    try:
-        resp = httpx.post(config.JEV_API_URL, json=payload, headers=headers, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-
-        # Jev returns {"answers": {...}}
-        answers = data.get("answers")
-        if not answers:
-            logger.warning("Jev response has no 'answers' key: %s", data)
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = httpx.post(config.JEV_API_URL, json=payload, headers=headers, timeout=30)
+            resp.raise_for_status()
+            answers = resp.json().get("answers")
+            if not answers:
+                logger.warning("Jev response has no 'answers' key")
+                return None
+            return answers
+        except httpx.HTTPStatusError as exc:
+            logger.warning("Jev API HTTP %s: %.200s", exc.response.status_code, exc.response.text)
+            return None  # 4xx/5xx: don't hammer
+        except (httpx.TimeoutException, httpx.RequestError) as exc:
+            logger.warning("Jev API network error (attempt %d/%d): %s", attempt, attempts, exc)
+            if attempt < attempts:
+                time.sleep(2)
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning("Jev API returned non-JSON: %s", exc)
             return None
-
-        return answers
-
-    except httpx.HTTPStatusError as exc:
-        logger.warning("Jev API HTTP %s: %.200s", exc.response.status_code, exc.response.text)
-    except httpx.TimeoutException:
-        logger.warning("Jev API timeout (30s)")
-    except httpx.RequestError as exc:
-        logger.warning("Jev API request error: %s", exc)
-    except json.JSONDecodeError as exc:
-        logger.warning("Jev API returned non-JSON: %s", exc)
-    except Exception as exc:
-        logger.exception("Unexpected Jev API error: %s", exc)
-
+        except Exception:
+            logger.exception("Unexpected Jev API error")
+            return None
     return None
 
 
-# ── Public interface ────────────────────────────────────────────────────────
-
+# ── Parsing ─────────────────────────────────────────────────────────────────
 
 def _parse_jev_response(raw: dict[str, Any] | None) -> DecisionResult:
-    """Parse the Jev typed-decision API response into a DecisionResult.
-
-    Jev returns answers in the format:
-    - direction (choice): {"choice": "up", "probabilities": {"up": 0.6, ...}}
-    - conviction (score): {"score": 1.21, "probabilities": {"0": 0.15, ...}}
-    - should_trade (noul): {"noul": 0.39}
-    """
+    """Parse the typed-decision response into a DecisionResult."""
     result = DecisionResult(direction="pass", conviction=0, should_trade=False)
-
     if raw is None:
         result.parse_errors.append("No response from Jev API")
         return result
 
     result.raw_response = json.dumps(raw)
 
-    # Parse direction (choice type)
-    direction_data = raw.get("direction", {})
-    if isinstance(direction_data, dict):
-        choice = direction_data.get("choice")
-        if isinstance(choice, str):
-            choice = choice.strip().lower()
-            if choice in ("up", "down", "pass"):
-                result.direction = choice
-            else:
-                result.parse_errors.append(f"Invalid direction value: {choice}")
-        elif choice is not None:
-            result.parse_errors.append(f"Non-string direction: {choice}")
+    # direction (choice)
+    d = raw.get("direction", {})
+    if isinstance(d, dict):
+        choice = d.get("choice")
+        if isinstance(choice, str) and choice.strip().lower() in ("up", "down", "pass"):
+            result.direction = choice.strip().lower()
         else:
-            result.parse_errors.append("No 'choice' key in direction response")
+            result.parse_errors.append(f"Invalid direction: {choice!r}")
+        probs = d.get("probabilities")
+        if isinstance(probs, dict):
+            up, down = probs.get("up"), probs.get("down")
+            if isinstance(up, (int, float)) and isinstance(down, (int, float)) and (up + down) > 0:
+                result.p_up = up / (up + down)
     else:
-        result.parse_errors.append(f"Unexpected direction format: {direction_data}")
+        result.parse_errors.append(f"Unexpected direction format: {d!r}")
 
-    # Parse conviction (score type)
-    conviction_data = raw.get("conviction", {})
-    if isinstance(conviction_data, dict):
-        score = conviction_data.get("score")
-        if isinstance(score, (int, float)):
-            # Map float score (0-3) to nearest int
-            result.conviction = max(0, min(3, round(score)))
-        elif score is not None:
-            result.parse_errors.append(f"Non-numeric conviction score: {score}")
-        else:
-            result.parse_errors.append("No 'score' key in conviction response")
+    # conviction (score)
+    c = raw.get("conviction", {})
+    score = c.get("score") if isinstance(c, dict) else None
+    if isinstance(score, (int, float)) and not isinstance(score, bool):
+        result.conviction = max(0, min(3, round(score)))
     else:
-        result.parse_errors.append(f"Unexpected conviction format: {conviction_data}")
+        result.parse_errors.append(f"Bad conviction score: {score!r}")
 
-    # Parse should_trade (noul type — threshold the float)
-    trade_data = raw.get("should_trade", {})
-    if isinstance(trade_data, dict):
-        noul = trade_data.get("noul")
-        if isinstance(noul, (int, float)):
-            # Threshold: trade if probability > 0.5
-            result.should_trade = float(noul) > 0.5
-        elif isinstance(noul, bool):
-            result.should_trade = noul
-        elif noul is not None:
-            result.parse_errors.append(f"Non-float noul value: {noul}")
-        else:
-            result.parse_errors.append("No 'noul' key in should_trade response")
+    # should_trade (noul: probability -> threshold at 0.5)
+    t = raw.get("should_trade", {})
+    noul = t.get("noul") if isinstance(t, dict) else None
+    if isinstance(noul, bool):
+        result.should_trade = noul
+    elif isinstance(noul, (int, float)):
+        result.should_trade = float(noul) > 0.5
     else:
-        result.parse_errors.append(f"Unexpected should_trade format: {trade_data}")
+        result.parse_errors.append(f"Bad noul value: {noul!r}")
 
-    # Extract reasoning from probabilities for logging
     parts = []
-    for key in ("direction", "conviction", "should_trade"):
+    for key in ("direction", "conviction"):
         entry = raw.get(key, {})
-        if isinstance(entry, dict):
-            if "probabilities" in entry:
-                parts.append(f"{key}={entry['probabilities']}")
-            elif "noul" in entry:
-                parts.append(f"{key}={entry['noul']:.2f}")
-    if parts:
-        result.reasoning = "; ".join(parts)
-
+        if isinstance(entry, dict) and "probabilities" in entry:
+            parts.append(f"{key}={entry['probabilities']}")
+    if isinstance(noul, (int, float)) and not isinstance(noul, bool):
+        parts.append(f"should_trade={noul:.2f}")
+    result.reasoning = "; ".join(parts)
     return result
 
 
-def decide_trade(
-    event_data: dict[str, Any],
-    price_context: dict[str, Any],
-) -> DecisionResult:
+def decide_trade(event_data: dict[str, Any], ctx: dict[str, Any]) -> DecisionResult:
     """Single batched Jev call — all three questions in one request.
 
-    Args:
-        event_data: Raw event dict from get_current_event().
-        price_context: Dict with yes_price, no_price, order_book_yes,
-                      order_book_no, recent_trades.
-
-    Returns:
-        DecisionResult with direction, conviction, should_trade.
+    ``ctx`` keys: spot, strike, minutes_left, minute_vol, p_yes_model,
+    yes_ask, no_ask, order_book_yes, order_book_no.
     """
-    prompt = _build_prompt(event_data, price_context)
-    raw_response = _call_jev(prompt)
-    decision = _parse_jev_response(raw_response)
-
+    prompt = _build_prompt(event_data, ctx)
+    decision = _parse_jev_response(_call_jev(prompt))
+    if decision.parse_errors:
+        logger.warning("Jev parse issues: %s", decision.parse_errors)
     logger.info(
         "Jev decision: %s (conviction=%d, trade=%s%s)",
         decision.direction,
@@ -303,5 +236,4 @@ def decide_trade(
         decision.should_trade,
         f" — {decision.reasoning[:100]}" if decision.reasoning else "",
     )
-
     return decision
