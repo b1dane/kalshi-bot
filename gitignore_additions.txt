@@ -1,0 +1,7 @@
+# Append these lines to your .gitignore
+.env
+paper_state.json
+paper_state.json.tmp
+paper_state.json.corrupt-*
+__pycache__/
+*.pyc
