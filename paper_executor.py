@@ -1,9 +1,15 @@
 """Paper trading executor — virtual balance, position tracking, settlement.
 
 Starts with $100 virtual balance.
-When Jev says trade, paper-buys at current market yes/no price.
+When Jev says trade, paper-buys contracts at the current ask price.
 Tracks open positions and checks settlement via Kalshi API every 60s.
+
+Patched:
+- Settlement reads the {"market": {...}} wrapper and the `result` field
+- MAX_BET now really caps the dollar cost of a trade (sizes contracts)
+- Voided/unresolvable finalized markets are refunded instead of hanging forever
 """
+
 import json
 import logging
 import os
@@ -14,8 +20,6 @@ from kalshi_data import get_market
 
 logger = logging.getLogger("kalshi_bot")
 
-# ── State file ──────────────────────────────────────────────────────────────
-
 STATE_FILE = os.path.join(os.path.dirname(__file__), "paper_state.json")
 
 
@@ -23,42 +27,34 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# ── Data classes ────────────────────────────────────────────────────────────
-
-
 class PaperExecutor:
-    """Virtual paper trading engine.
-
-    State persisted to ``paper_state.json`` for survival across restarts.
-    """
+    """Virtual paper trading engine. State persisted to paper_state.json."""
 
     INITIAL_BALANCE: float = 100.0
-    MAX_BET: float = 5.0          # max $ per trade entry
-    STOP_THRESHOLD: float = 0.75   # +75% PnL locks the bot
-    MIN_TRADE_THRESHOLD: float = 0.30  # +30% PnL required to allow next trade after losses
+    MAX_BET: float = 5.0  # max $ cost per trade entry
+    STOP_THRESHOLD: float = 0.75  # +75% PnL locks the bot
+    MIN_TRADE_THRESHOLD: float = 0.30  # (unused, kept for compatibility)
 
     def __init__(self, state_file: str | None = None):
         self.state_file = state_file or STATE_FILE
         self.balance: float = self.INITIAL_BALANCE
-        self.positions: list[dict[str, Any]] = []  # open positions
-        self.trade_history: list[dict[str, Any]] = []  # all trades (open + settled)
+        self.positions: list[dict[str, Any]] = []
+        self.trade_history: list[dict[str, Any]] = []
         self.total_trades: int = 0
         self.wins: int = 0
         self.losses: int = 0
-        self.balance_history: list[dict[str, Any]] = []  # [{timestamp, balance}, ...]
-        self.bot_locked: bool = False   # locked when +75% PnL hit — manual restart only
-        self.locked_reason: str = ""    # why bot is locked
+        self.balance_history: list[dict[str, Any]] = []
+        self.bot_locked: bool = False
+        self.locked_reason: str = ""
         self._load_state()
 
     # ── State persistence ──────────────────────────────────────────────────
 
     def _load_state(self) -> None:
-        """Load state from JSON file if it exists."""
         if not os.path.isfile(self.state_file):
             self._record_balance()
             self._save_state()
             return
-
         try:
             with open(self.state_file) as f:
                 data = json.load(f)
@@ -71,13 +67,15 @@ class PaperExecutor:
             self.balance_history = data.get("balance_history", [])
             self.bot_locked = data.get("bot_locked", False)
             self.locked_reason = data.get("locked_reason", "")
-            logger.info("Paper state loaded: balance=$%.2f, trades=%d, locked=%s", self.balance, self.total_trades, self.bot_locked)
+            logger.info(
+                "Paper state loaded: balance=$%.2f, trades=%d, locked=%s",
+                self.balance, self.total_trades, self.bot_locked,
+            )
         except (json.JSONDecodeError, KeyError, OSError) as exc:
             logger.warning("Could not load paper state (%s), starting fresh", exc)
             self._record_balance()
 
     def _save_state(self) -> None:
-        """Persist current state to JSON file."""
         data = {
             "balance": round(self.balance, 2),
             "positions": self.positions,
@@ -89,24 +87,22 @@ class PaperExecutor:
             "bot_locked": self.bot_locked,
             "locked_reason": self.locked_reason,
         }
-        with open(self.state_file, "w") as f:
+        tmp = self.state_file + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(data, f, indent=2)
+        os.replace(tmp, self.state_file)  # atomic: no half-written state on crash
 
     def _record_balance(self) -> None:
-        """Record current balance in history."""
         self.balance_history.append({"timestamp": _utcnow(), "balance": round(self.balance, 2)})
+
+    # ── Risk gates ─────────────────────────────────────────────────────────
 
     @property
     def pnl_ratio(self) -> float:
-        """Profit/loss as a fraction of initial balance (0.75 = +75%)."""
         return round((self.balance - self.INITIAL_BALANCE) / self.INITIAL_BALANCE, 4)
 
     @property
     def can_trade(self) -> tuple[bool, str]:
-        """Check if trading is allowed under all risk limits.
-
-        Returns (allowed, reason). If not allowed, reason explains why.
-        """
         if self.bot_locked:
             return False, self.locked_reason or "Bot locked — manual restart required"
         if self.balance <= 0:
@@ -131,37 +127,33 @@ class PaperExecutor:
         no_price: float,
         target_price: float,
     ) -> dict[str, Any] | None:
-        """Execute a paper trade and record it.
+        """Paper-buy contracts on the chosen side.
 
-        Buys one contract at the current YES price.
-
-        Returns:
-            Trade record dict, or None if balance insufficient.
+        yes_price / no_price are the ASK prices in dollars (0-1).
+        Contract count is sized so total cost never exceeds MAX_BET.
         """
         entry_price = yes_price if direction == "up" else no_price
 
-        # Enforce hard $5 max bet per trade
-        entry_price = min(entry_price, self.MAX_BET)
-        if entry_price <= 0:
-            logger.warning("Empty/invalid entry price — not trading")
+        if not (0.0 < entry_price < 1.0):
+            logger.warning("Invalid entry price %.4f — not trading", entry_price)
             return None
 
-        # Enforce risk limits (locked, negative balance, +75% stop)
         allowed, reason = self.can_trade
         if not allowed:
             logger.info("Trade blocked: %s", reason)
             return None
 
-        if self.balance < entry_price:
+        # Size: cap by MAX_BET and by what we can actually afford
+        contracts = int(min(self.MAX_BET, self.balance) // entry_price)
+        if contracts < 1:
             logger.warning(
-                "Insufficient balance: $%.2f needed, $%.2f available",
-                entry_price, self.balance,
+                "Insufficient balance: $%.2f available, $%.2f needed for 1 contract",
+                self.balance, entry_price,
             )
             return None
 
-        # Deduct from balance
-        self.balance -= entry_price
-        self.balance = round(self.balance, 2)
+        cost = round(contracts * entry_price, 4)
+        self.balance = round(self.balance - cost, 2)
 
         trade = {
             "id": f"{market_ticker}-{int(datetime.now(timezone.utc).timestamp())}",
@@ -170,6 +162,8 @@ class PaperExecutor:
             "direction": direction,
             "conviction": conviction,
             "entry_price": round(entry_price, 4),
+            "contracts": contracts,
+            "cost": cost,
             "yes_price_at_entry": round(yes_price, 4),
             "no_price_at_entry": round(no_price, 4),
             "target_price": target_price,
@@ -179,7 +173,6 @@ class PaperExecutor:
             "pnl": None,
             "settled_at": None,
         }
-
         self.positions.append(trade)
         self.trade_history.append(trade)
         self.total_trades += 1
@@ -187,77 +180,73 @@ class PaperExecutor:
         self._save_state()
 
         logger.info(
-            "Paper trade: %s %s @ $%.4f (balance=$%.2f)",
-            direction.upper(), market_ticker, entry_price, self.balance,
+            "Paper trade: %s %s %dx @ $%.4f cost=$%.2f (balance=$%.2f)",
+            direction.upper(), market_ticker, contracts, entry_price, cost, self.balance,
         )
-
         return trade
 
     # ── Settlement ─────────────────────────────────────────────────────────
 
     def check_settlements(self) -> list[dict[str, Any]]:
-        """Check all open positions for settlement via Kalshi API.
-
-        Returns list of newly-settled trade dicts.
-        """
-        newly_settled = []
-        still_open = []
+        """Check open positions against Kalshi; return newly settled trades."""
+        newly_settled: list[dict[str, Any]] = []
+        still_open: list[dict[str, Any]] = []
 
         for trade in self.positions:
-            market_data = get_market(trade["market_ticker"])
-            if market_data is None:
-                # Can't reach Kalshi — keep as open
+            raw = get_market(trade["market_ticker"])
+            if raw is None:
                 still_open.append(trade)
                 continue
 
-            status = market_data.get("status", "")
-            if status != "settled":
-                still_open.append(trade)
-                continue
+            # Single-market endpoint wraps the payload in {"market": {...}}
+            market = raw.get("market", raw)
+            status = str(market.get("status") or "").lower()
+            result = str(market.get("result") or "").lower()
 
-            # Market is settled — determine outcome
-            close_price = market_data.get("close_price", None)
-            if close_price is not None:
-                if trade["direction"] == "up":
-                    was_correct = bool(close_price == 1.0)
+            contracts = trade.get("contracts", 1)  # old state files had 1 contract
+            cost = trade.get("cost", trade["entry_price"] * contracts)
+
+            if result not in ("yes", "no"):
+                if status in ("finalized", "settled"):
+                    # Finalized with no yes/no result (void/scalar): refund the cost
+                    self.balance = round(self.balance + cost, 2)
+                    trade.update(
+                        settled=True, was_correct=None, pnl=0.0, settled_at=_utcnow()
+                    )
+                    self.total_trades = max(0, self.total_trades - 1)
+                    logger.warning("Market %s finalized without yes/no — refunded", trade["market_ticker"])
+                    newly_settled.append(trade)
                 else:
-                    was_correct = bool(close_price == 0.0)
-            else:
-                # Try result field
-                result = market_data.get("result", "")
-                was_correct = result.lower() == "yes" if trade["direction"] == "up" else result.lower() == "no"
+                    still_open.append(trade)
+                continue
 
-            # Calculate PnL
+            was_correct = (result == "yes") == (trade["direction"] == "up")
+
             if was_correct:
-                pnl = 1.0 - trade["entry_price"]
+                payout = float(contracts)  # $1 per contract
                 self.wins += 1
             else:
-                pnl = -trade["entry_price"]
+                payout = 0.0
                 self.losses += 1
 
-            pnl = round(pnl, 4)
-            self.balance += 1.0 if was_correct else 0.0
-            self.balance = round(self.balance, 2)
+            pnl = round(payout - cost, 4)
+            self.balance = round(self.balance + payout, 2)
 
             trade["settled"] = True
             trade["was_correct"] = was_correct
             trade["pnl"] = pnl
             trade["settled_at"] = _utcnow()
-
             newly_settled.append(trade)
 
             logger.info(
                 "Settled %s: %s ($%.2f pnl, balance=$%.2f)",
-                trade["market_ticker"],
-                "WIN" if was_correct else "LOSS",
-                pnl,
-                self.balance,
+                trade["market_ticker"], "WIN" if was_correct else "LOSS", pnl, self.balance,
             )
 
         self.positions = still_open
-        self._record_balance()
+        if newly_settled:
+            self._record_balance()
         self._save_state()
-
         return newly_settled
 
     # ── Stats ──────────────────────────────────────────────────────────────
@@ -278,11 +267,9 @@ class PaperExecutor:
         return len(self.positions)
 
     def recent_trades(self, n: int = 10) -> list[dict[str, Any]]:
-        """Return the N most recent trades (settled or not)."""
         return list(reversed(self.trade_history[-n:]))
 
     def get_status_summary(self) -> dict[str, Any]:
-        """Return a dict summary for display."""
         return {
             "balance": self.balance,
             "pnl": self.pnl,
