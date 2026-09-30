@@ -194,30 +194,8 @@ def _local_trades() -> list:
 
 
 def _fetch_supabase_trades(limit: int) -> list:
-    if supabase is None or not supabase.ready:
-        return []
-    import httpx
-    base = config.SUPABASE_URL.rstrip("/")
-    key = config.SUPABASE_SERVICE_KEY
-    if not base or not key:
-        return []
-    headers = {"apikey": key, "Authorization": f"Bearer {key}"}
-    url = f"{base}/rest/v1/kalshi_trades"
-    params = {"order": "created_at.desc", "limit": limit}
-    try:
-        resp = httpx.get(url, headers=headers, params=params, timeout=8)
-        if resp.status_code < 400:
-            rows = resp.json()
-        else:
-            return []
-    except Exception:
-        return []
-    out = []
-    for r in rows:
-        n = _normalize(r)
-        out.append(n)
-    out.sort(key=lambda t: t.get("entry_time") or "", reverse=True)
-    return out
+    """Supabase is intentionally disabled; dashboard uses local paper state."""
+    return []
 
 
 # ── FastAPI app ──────────────────────────────────────────────────────────────
